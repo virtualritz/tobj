@@ -8,6 +8,11 @@ Aims to be a simple and lightweight option for loading `OBJ` files.
 
 Just returns two `Vec`s containing loaded models and materials.
 
+Note: These days I recommend you use [glTF](https://www.khronos.org/gltf/) if you control
+the model format coming into your app, since it's binary and will load faster.
+There's a good crate for loading gltf: [gltf-rs](https://github.com/gltf-rs/gltf),
+plus some others that are likely also good.
+
 ## Triangulation
 
 Meshes can be triangulated on the fly or left as-is.
@@ -78,6 +83,16 @@ parameter and its value.
 * `async` – Adds support for async loading of obj files from a buffer, with an
    async material loader. Useful in environments that do not support blocking
    IO (e.g. WebAssembly).
+
+* `futures` - Adds support for async loading of objs and materials using
+  [futures](https://crates.io/crates/futures)
+  [`AsyncRead`](https://docs.rs/futures-io/latest/futures_io/trait.AsyncRead.html)
+  traits.
+
+* `tokio` - Adds support for async loading of objs and materials using
+  [tokio](https://crates.io/crates/tokio)
+  ['AsyncRead`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html)
+  traits.
 
 ## Documentation
 

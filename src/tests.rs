@@ -3,13 +3,20 @@ use std::{
     env,
     fs::File,
     io::{BufReader, Cursor},
+    ops::ControlFlow,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use crate as tobj;
+use tobj::{load_mtl_buf, load_obj_buf, LoadError, LoadOptions, LoadProgressCallback};
 
-const CORNELL_BOX_OBJ: &'static str = include_str!("../obj/cornell_box.obj");
-const CORNELL_BOX_MTL1: &'static str = include_str!("../obj/cornell_box.mtl");
-const CORNELL_BOX_MTL2: &'static str = include_str!("../obj/cornell_box2.mtl");
+const CORNELL_BOX_OBJ: &str = include_str!("../obj/cornell_box.obj");
+const CORNELL_BOX_MTL1: &str = include_str!("../obj/cornell_box.mtl");
+const CORNELL_BOX_MTL2: &str = include_str!("../obj/cornell_box2.mtl");
 
 // Set the tolerance for float comparison
 use crate::Float;
@@ -209,17 +216,19 @@ fn non_triangulated_quad() {
     assert!(mats.is_empty());
 
     // First one is a quad formed by two triangles
-    // so face_arities is empty (all trinagles)
-    assert!(models[0].mesh.face_arities.is_empty());
+    // so face_arities is None (all triangles)
+    assert!(models[0].mesh.face_arities.is_none());
+    assert!(models[0].mesh.is_triangulated());
 
     // Second is a quad face
-    assert_eq!(models[1].mesh.face_arities.len(), 1);
-    assert_eq!(models[1].mesh.face_arities[0], 4);
+    assert_eq!(models[1].mesh.face_count(), 1);
+    assert_eq!(models[1].mesh.face_arity(0), 4);
     let expect_quad_indices = vec![0, 1, 2, 3];
     assert_eq!(models[1].mesh.indices, expect_quad_indices);
 
     // Third is a triangle
-    assert!(models[2].mesh.face_arities.is_empty());
+    assert!(models[2].mesh.face_arities.is_none());
+    assert!(models[2].mesh.is_triangulated());
 }
 
 #[test]
@@ -271,6 +280,7 @@ fn multiple_face_formats() {
     assert!(tri.texcoords.is_empty());
 }
 
+#[allow(clippy::excessive_precision)]
 fn validate_cornell(models: Vec<tobj::Model>, mats: Vec<tobj::Material>) {
     // Verify the floor loaded properly
     assert_eq!(models[0].name, "floor");
@@ -389,9 +399,9 @@ fn validate_cornell(models: Vec<tobj::Model>, mats: Vec<tobj::Material>) {
     // Verify white material loaded properly
     assert_eq!(mats[0].name, "white");
     let mat = &mats[0];
-    assert_float_eq!(mat.ambient, [0.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.diffuse, [1.0, 1.0, 1.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.specular, [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.ambient.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.diffuse.unwrap(), [1.0, 1.0, 1.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.specular.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
     assert_eq!(
         mat.unknown_param.get("Ke").map(|s| s.as_ref()),
         Some("1 1 1")
@@ -401,27 +411,42 @@ fn validate_cornell(models: Vec<tobj::Model>, mats: Vec<tobj::Material>) {
     // Verify red material loaded properly
     assert_eq!(mats[1].name, "red");
     let mat = &mats[1];
-    assert_float_eq!(mat.ambient, [0.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.diffuse, [1.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.specular, [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.ambient.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.diffuse.unwrap(), [1.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.specular.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
     assert_eq!(mat.illumination_model, Some(2));
-    assert_eq!(mat.ambient_texture, "this ambient texture has spaces.jpg");
-    assert_eq!(mat.diffuse_texture, "this diffuse texture has spaces.jpg");
-    assert_eq!(mat.specular_texture, "this specular texture has spaces.jpg");
-    assert_eq!(mat.normal_texture, "this normal texture has spaces.jpg");
+    assert_eq!(
+        mat.ambient_texture,
+        Some("this ambient texture has spaces.jpg".to_owned())
+    );
+    assert_eq!(
+        mat.diffuse_texture,
+        Some("this diffuse texture has spaces.jpg".to_owned())
+    );
+    assert_eq!(
+        mat.specular_texture,
+        Some("this specular texture has spaces.jpg".to_owned())
+    );
+    assert_eq!(
+        mat.normal_texture,
+        Some("this normal texture has spaces.jpg".to_owned())
+    );
     assert_eq!(
         mat.shininess_texture,
-        "this shininess texture has spaces.jpg"
+        Some("this shininess texture has spaces.jpg".to_owned())
     );
-    assert_eq!(mat.dissolve_texture, "this dissolve texture has spaces.jpg");
+    assert_eq!(
+        mat.dissolve_texture,
+        Some("this dissolve texture has spaces.jpg".to_owned())
+    );
 
     // Verify blue material loaded properly
     assert_eq!(mats[2].name, "blue");
     let mat = &mats[2];
-    assert_float_eq!(mat.ambient, [0.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.diffuse, [0.0, 0.0, 1.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.specular, [0.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_eq!(mat.shininess, 10.0);
+    assert_float_eq!(mat.ambient.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.diffuse.unwrap(), [0.0, 0.0, 1.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.specular.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_eq!(mat.shininess, Some(10.0));
     assert_eq!(mat.unknown_param.len(), 1);
     assert_eq!(
         mat.unknown_param.get("crazy_unknown"),
@@ -431,24 +456,24 @@ fn validate_cornell(models: Vec<tobj::Model>, mats: Vec<tobj::Material>) {
     // Verify light material loaded properly
     assert_eq!(mats[3].name, "light");
     let mat = &mats[3];
-    assert_float_eq!(mat.ambient, [20.0, 20.0, 20.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.diffuse, [1.0, 1.0, 1.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.specular, [0.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_eq!(mat.dissolve, 0.8);
-    assert_eq!(mat.optical_density, 1.25);
+    assert_float_eq!(mat.ambient.unwrap(), [20.0, 20.0, 20.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.diffuse.unwrap(), [1.0, 1.0, 1.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.specular.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_eq!(mat.dissolve, Some(0.8));
+    assert_eq!(mat.optical_density, Some(1.25));
 
     // Verify green material loaded properly
     assert_eq!(mats[4].name, "green");
     let mat = &mats[4];
-    assert_float_eq!(mat.ambient, [0.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.diffuse, [0.0, 1.0, 0.0], r2nd_all <= TOL);
-    assert_float_eq!(mat.specular, [0.0, 0.0, 0.0], r2nd_all <= TOL);
-    assert_eq!(mat.ambient_texture, "dummy_texture.png");
-    assert_eq!(mat.diffuse_texture, "dummy_texture.png");
-    assert_eq!(mat.specular_texture, "dummy_texture.png");
-    assert_eq!(mat.normal_texture, "dummy_texture.png");
-    assert_eq!(mat.shininess_texture, "dummy_texture.png");
-    assert_eq!(mat.dissolve_texture, "dummy_texture.png");
+    assert_float_eq!(mat.ambient.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.diffuse.unwrap(), [0.0, 1.0, 0.0], r2nd_all <= TOL);
+    assert_float_eq!(mat.specular.unwrap(), [0.0, 0.0, 0.0], r2nd_all <= TOL);
+    assert_eq!(mat.ambient_texture, Some("dummy_texture.png".to_owned()));
+    assert_eq!(mat.diffuse_texture, Some("dummy_texture.png".to_owned()));
+    assert_eq!(mat.specular_texture, Some("dummy_texture.png".to_owned()));
+    assert_eq!(mat.normal_texture, Some("dummy_texture.png".to_owned()));
+    assert_eq!(mat.shininess_texture, Some("dummy_texture.png".to_owned()));
+    assert_eq!(mat.dissolve_texture, Some("dummy_texture.png".to_owned()));
 }
 
 #[test]
@@ -495,6 +520,7 @@ fn test_custom_material_loader() {
 #[cfg(feature = "async")]
 #[test]
 fn test_async_custom_material_loader() {
+    #[allow(deprecated)]
     let m = tokio_test::block_on(tobj::load_obj_buf_async(
         &mut Cursor::new(CORNELL_BOX_OBJ),
         &tobj::LoadOptions {
@@ -516,6 +542,42 @@ fn test_async_custom_material_loader() {
     assert_eq!(models.len(), 8);
     assert_eq!(mats.len(), 5);
     validate_cornell(models, mats);
+}
+
+#[cfg(feature = "futures")]
+mod futures {
+    use super::*;
+    use crate::futures::{load_mtl_buf, load_obj_buf};
+    use futures_lite::{future, io::BufReader};
+
+    #[test]
+    fn test_custom_material_loader() {
+        let m = future::block_on(load_obj_buf(
+            BufReader::new(CORNELL_BOX_OBJ.as_bytes()),
+            &crate::LoadOptions {
+                triangulate: true,
+                single_index: true,
+                ..Default::default()
+            },
+            |p| async move {
+                match p.to_str().unwrap() {
+                    "cornell_box.mtl" => {
+                        load_mtl_buf(BufReader::new(CORNELL_BOX_MTL1.as_bytes())).await
+                    }
+                    "cornell_box2.mtl" => {
+                        load_mtl_buf(BufReader::new(CORNELL_BOX_MTL2.as_bytes())).await
+                    }
+                    _ => unreachable!(),
+                }
+            },
+        ));
+        assert!(m.is_ok());
+        let (models, mats) = m.unwrap();
+        let mats = mats.unwrap();
+        assert_eq!(models.len(), 8);
+        assert_eq!(mats.len(), 5);
+        validate_cornell(models, mats);
+    }
 }
 
 #[test]
@@ -559,6 +621,91 @@ fn test_custom_material_loader_files() {
 }
 
 #[test]
+fn test_progress_callback_noop_matches_no_callback() {
+    let material_loader = |p: &Path| match p.to_str().unwrap() {
+        "cornell_box.mtl" => load_mtl_buf(&mut BufReader::new(CORNELL_BOX_MTL1.as_bytes())),
+        "cornell_box2.mtl" => load_mtl_buf(&mut BufReader::new(CORNELL_BOX_MTL2.as_bytes())),
+        _ => unreachable!(),
+    };
+
+    let without_callback = load_obj_buf(
+        &mut Cursor::new(CORNELL_BOX_OBJ.as_bytes()),
+        &LoadOptions {
+            triangulate: true,
+            single_index: true,
+            ..Default::default()
+        },
+        material_loader,
+    );
+
+    let with_callback = load_obj_buf(
+        &mut Cursor::new(CORNELL_BOX_OBJ.as_bytes()),
+        &LoadOptions {
+            triangulate: true,
+            single_index: true,
+            progress_callback: Some(LoadProgressCallback::new(|_progress| {
+                ControlFlow::Continue(())
+            })),
+            ..Default::default()
+        },
+        material_loader,
+    );
+
+    // A no-op progress callback must not change the parse result in any way.
+    assert_eq!(
+        format!("{:?}", without_callback),
+        format!("{:?}", with_callback)
+    );
+}
+
+#[test]
+fn test_progress_callback_cancels_load() {
+    // More lines than the progress-report throttle interval, so the
+    // callback is guaranteed to fire (and cancel the load) before EOF.
+    let obj = "v 0.0 0.0 0.0\n".repeat(2500);
+
+    let result = load_obj_buf(
+        &mut Cursor::new(obj.as_bytes()),
+        &LoadOptions {
+            progress_callback: Some(LoadProgressCallback::new(
+                |_progress| ControlFlow::Break(()),
+            )),
+            ..Default::default()
+        },
+        |_| unreachable!("no mtllib in the synthetic buffer"),
+    );
+
+    assert_eq!(result.unwrap_err(), LoadError::Cancelled);
+}
+
+#[test]
+fn test_progress_callback_is_throttled() {
+    let line_count = 10_000usize;
+    let obj = "v 0.0 0.0 0.0\n".repeat(line_count);
+
+    let call_count = Arc::new(AtomicU64::new(0));
+    let call_count_clone = call_count.clone();
+    let result = load_obj_buf(
+        &mut Cursor::new(obj.as_bytes()),
+        &LoadOptions {
+            progress_callback: Some(LoadProgressCallback::new(move |_progress| {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                ControlFlow::Continue(())
+            })),
+            ..Default::default()
+        },
+        |_| unreachable!("no mtllib in the synthetic buffer"),
+    );
+
+    assert!(result.is_ok());
+    // The callback must be throttled, i.e. called far less often than once
+    // per line.
+    let calls = call_count.load(Ordering::SeqCst);
+    assert!(calls > 0);
+    assert!((calls as usize) < line_count);
+}
+
+#[test]
 fn test_invalid_index() {
     let m = tobj::load_obj(
         "obj/invalid_index.obj",
@@ -571,4 +718,58 @@ fn test_invalid_index() {
     assert!(m.is_err());
     let err = m.err().unwrap();
     assert_eq!(err, tobj::LoadError::FaceVertexOutOfBounds);
+}
+
+#[cfg(feature = "tokio")]
+mod tokio {
+    use super::*;
+    use crate::tokio::{load_mtl_buf, load_obj, load_obj_buf};
+    use ::tokio::io::BufReader;
+
+    #[test]
+    fn test_cornell() {
+        let m = tokio_test::block_on(load_obj(
+            "obj/cornell_box.obj",
+            &crate::LoadOptions {
+                triangulate: true,
+                single_index: true,
+                ..Default::default()
+            },
+        ));
+        assert!(m.is_ok());
+        let (models, mats) = m.unwrap();
+        let mats = mats.unwrap();
+        assert_eq!(models.len(), 8);
+        assert_eq!(mats.len(), 5);
+        validate_cornell(models, mats);
+    }
+
+    #[test]
+    fn test_custom_material_loader() {
+        let m = tokio_test::block_on(load_obj_buf(
+            BufReader::new(CORNELL_BOX_OBJ.as_bytes()),
+            &crate::LoadOptions {
+                triangulate: true,
+                single_index: true,
+                ..Default::default()
+            },
+            |p| async move {
+                match p.to_str().unwrap() {
+                    "cornell_box.mtl" => {
+                        load_mtl_buf(BufReader::new(CORNELL_BOX_MTL1.as_bytes())).await
+                    }
+                    "cornell_box2.mtl" => {
+                        load_mtl_buf(BufReader::new(CORNELL_BOX_MTL2.as_bytes())).await
+                    }
+                    _ => unreachable!(),
+                }
+            },
+        ));
+        assert!(m.is_ok());
+        let (models, mats) = m.unwrap();
+        let mats = mats.unwrap();
+        assert_eq!(models.len(), 8);
+        assert_eq!(mats.len(), 5);
+        validate_cornell(models, mats);
+    }
 }
