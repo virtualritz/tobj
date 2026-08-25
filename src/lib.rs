@@ -83,18 +83,11 @@
 //!     println!("model[{}].name = \'{}\'", i, m.name);
 //!     println!("model[{}].mesh.material_id = {:?}", i, mesh.material_id);
 //!
-//!     println!(
-//!         "Size of model[{}].face_arities: {}",
-//!         i,
-//!         mesh.face_arities.len()
-//!     );
+//!     println!("model[{}].face_count = {}", i, mesh.face_count());
 //!
-//!     let mut next_face = 0;
-//!     for f in 0..mesh.face_arities.len() {
-//!         let end = next_face + mesh.face_arities[f] as usize;
-//!         let face_indices: Vec<_> = mesh.indices[next_face..end].iter().collect();
+//!     for f in 0..mesh.face_count() {
+//!         let face_indices = mesh.face_indices(f);
 //!         println!("    face[{}] = {:?}", f, face_indices);
-//!         next_face = end;
 //!     }
 //!
 //!     // Normals and texture coordinates are also loaded, but not printed in this example
@@ -194,7 +187,7 @@
 //! * [`ahash`](https://crates.io/crates/ahash) – On by default. Use [`AHashMap`](https://docs.rs/ahash/latest/ahash/struct.AHashMap.html)
 //!   for hashing when reading files and merging vertices. To disable and use
 //!   the slower [`HashMap`](std::collections::HashMap) instead, unset default
-//! features in `Cargo.toml`:
+//!   features in `Cargo.toml`:
 //!
 //!   ```toml
 //!   [dependencies.tobj]
@@ -235,8 +228,10 @@ use std::{
     fmt,
     fs::File,
     io::{prelude::*, BufReader},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     str::{FromStr, SplitWhitespace},
+    sync::Arc,
 };
 
 #[cfg(feature = "use_f64")]
@@ -251,11 +246,11 @@ use std::future::Future;
 #[cfg(feature = "merging")]
 use std::mem::size_of;
 
-#[cfg(feature = "ahash")]
-type HashMap<K, V> = ahash::AHashMap<K, V>;
+#[cfg(feature = "gxhash")]
+use gxhash::{HashMap, HashMapExt};
 
-#[cfg(not(feature = "ahash"))]
-type HashMap<K, V> = std::collections::HashMap<K, V>;
+#[cfg(not(feature = "gxhash"))]
+use std::collections::HashMap;
 
 /// Typical [`LoadOptions`] for using meshes in a GPU/relatime context.
 ///
@@ -270,6 +265,7 @@ pub const GPU_LOAD_OPTIONS: LoadOptions = LoadOptions {
     triangulate: true,
     ignore_points: true,
     ignore_lines: true,
+    progress_callback: None,
 };
 
 /// Typical [`LoadOptions`] for using meshes with an offline rendeder.
@@ -287,9 +283,10 @@ pub const OFFLINE_RENDERING_LOAD_OPTIONS: LoadOptions = LoadOptions {
     triangulate: false,
     ignore_points: true,
     ignore_lines: true,
+    progress_callback: None,
 };
 
-/// A mesh made up of triangles loaded from some `OBJ` file.
+/// A mesh made up of polygons loaded from some `OBJ` file.
 ///
 /// It is assumed that all meshes will at least have positions, but normals and
 /// texture coordinates are optional. If no normals or texture coordinates where
@@ -374,14 +371,20 @@ pub struct Mesh {
     /// Otherwise normals and texture coordinates have *their own* indices,
     /// each.
     pub indices: Vec<u32>,
-    /// The number of vertices (arity) of each face. *Empty* if loaded with
-    /// `triangulate` set to `true` or if the mesh constists *only* of
-    /// triangles.
+    /// The number of vertices (arity) of each face.
     ///
-    /// The offset for the starting index of a face can be found by iterating
-    /// through the `face_arities` until reaching the desired face, accumulating
-    /// the number of vertices used so far.
-    pub face_arities: Vec<u32>,
+    /// - `None` means all faces are triangles (3 vertices each).
+    /// - `Some(vec)` contains the vertex count for each face, which may include
+    ///   triangles (3), quads (4), or other polygons.
+    ///
+    /// When iterating through faces:
+    /// - If `None`, each face uses exactly 3 consecutive indices.
+    /// - If `Some(vec)`, the offset for face `i` is the sum of all previous
+    ///   face arities.
+    ///
+    /// This optimization saves memory for triangle-only meshes, which are
+    /// common in real-time rendering contexts.
+    pub face_arities: Option<Vec<u32>>,
     /// The indices for vertex colors. Only present when the
     /// [`merging`](LoadOptions::merge_identical_points) feature is enabled, and
     /// empty unless the corresponding load option is set to `true`.
@@ -396,6 +399,123 @@ pub struct Mesh {
     /// Optional material id associated with this mesh. The material id indexes
     /// into the Vec of Materials loaded from the associated `MTL` file
     pub material_id: Option<usize>,
+}
+
+impl Mesh {
+    /// Returns the number of faces in the mesh.
+    ///
+    /// For triangle-only meshes (when `face_arities` is `None`),
+    /// this is calculated as `indices.len() / 3`.
+    pub fn face_count(&self) -> usize {
+        match &self.face_arities {
+            None => self.indices.len() / 3,
+            Some(arities) => arities.len(),
+        }
+    }
+
+    /// Returns the number of vertices (arity) for a specific face.
+    ///
+    /// Returns 3 for triangle-only meshes (when `face_arities` is `None`).
+    /// Panics if the face index is out of bounds.
+    pub fn face_arity(&self, face_index: usize) -> usize {
+        match &self.face_arities {
+            None => {
+                assert!(
+                    face_index < self.indices.len() / 3,
+                    "Face index out of bounds"
+                );
+                3
+            }
+            Some(arities) => {
+                assert!(face_index < arities.len(), "Face index out of bounds");
+                arities[face_index] as usize
+            }
+        }
+    }
+
+    /// Returns true if all faces in the mesh are triangles.
+    pub fn is_triangulated(&self) -> bool {
+        self.face_arities.is_none()
+    }
+
+    /// Returns the indices for a specific face.
+    ///
+    /// For triangle-only meshes, returns a slice of exactly 3 indices.
+    /// For mixed meshes, returns a slice with the appropriate number of
+    /// indices.
+    pub fn face_indices(&self, face_index: usize) -> &[u32] {
+        match &self.face_arities {
+            None => {
+                let start = face_index * 3;
+                assert!(start + 3 <= self.indices.len(), "Face index out of bounds");
+                &self.indices[start..start + 3]
+            }
+            Some(arities) => {
+                assert!(face_index < arities.len(), "Face index out of bounds");
+                let mut start = 0;
+                for i in 0..face_index {
+                    start += arities[i] as usize;
+                }
+                let end = start + arities[face_index] as usize;
+                &self.indices[start..end]
+            }
+        }
+    }
+}
+
+/// A snapshot of progress made so far while parsing an `OBJ` buffer in
+/// [`load_obj_buf()`].
+///
+/// Passed to a [`LoadProgressCallback`] registered via
+/// [`LoadOptions::progress_callback`]. The callback is throttled – it is not
+/// invoked for every line read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadProgress {
+    /// Number of lines read from the buffer so far.
+    pub lines_read: u64,
+    /// Number of bytes read from the buffer so far.
+    ///
+    /// This is a lower bound: line-ending bytes stripped by
+    /// [`BufRead::lines()`](std::io::BufRead::lines) are not counted, since
+    /// they are not seen by the parser.
+    pub bytes_read: u64,
+}
+
+/// A throttled progress-report and cooperative-cancellation callback.
+///
+/// Wraps a closure that is invoked periodically while [`load_obj_buf()`]
+/// parses a buffer. Returning [`ControlFlow::Break`] from the closure aborts
+/// the load and causes [`load_obj_buf()`] to return
+/// [`LoadError::Cancelled`].
+///
+/// Register one via [`LoadOptions::progress_callback`].
+#[derive(Clone)]
+pub struct LoadProgressCallback(Arc<LoadProgressCallbackFn>);
+
+type LoadProgressCallbackFn = dyn Fn(&LoadProgress) -> ControlFlow<()> + Send + Sync;
+
+impl LoadProgressCallback {
+    /// Creates a new [`LoadProgressCallback`] from a closure.
+    pub fn new(f: impl Fn(&LoadProgress) -> ControlFlow<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Invokes the wrapped closure with the given `progress` snapshot.
+    fn call(&self, progress: &LoadProgress) -> ControlFlow<()> {
+        (self.0)(progress)
+    }
+}
+
+impl fmt::Debug for LoadProgressCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LoadProgressCallback(..)")
+    }
+}
+
+impl PartialEq for LoadProgressCallback {
+    fn eq(&self, _other: &Self) -> bool {
+        true // Not data.
+    }
 }
 
 /// Options for processing the mesh during loading.
@@ -421,7 +541,7 @@ pub struct Mesh {
 /// * [`OFFLINE_RENDERING_LOAD_OPTIONS`] – if you're rendering meshes with e.g.
 ///   an offline path tracer or the like.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct LoadOptions {
     /// Merge identical positions.
     ///
@@ -500,7 +620,7 @@ pub struct LoadOptions {
     ///   `ignore_lines` is/are set to `true`, resp.
     ///
     /// * The resulting `Mesh`'s [`face_arities`](Mesh::face_arities) will be
-    ///   empty as all faces are guranteed to have arity `3`.
+    ///   `None` as all faces are guaranteed to have arity `3`.
     ///
     /// * Only polygons that are trivially convertible to triangle fans are
     ///   supported. Arbitrary polygons may not behave as expected. The best
@@ -523,6 +643,16 @@ pub struct LoadOptions {
     /// Polygon meshes that contains faces with two vertices only usually do so
     /// because of bad topology.
     pub ignore_lines: bool,
+    /// Optional progress-report and cooperative-cancellation callback.
+    ///
+    /// If set, [`load_obj_buf()`] invokes it periodically (throttled; not on
+    /// every line) while parsing, passing it a [`LoadProgress`] snapshot.
+    /// Returning [`ControlFlow::Break`] from the callback aborts the load and
+    /// causes [`load_obj_buf()`] to return [`LoadError::Cancelled`].
+    ///
+    /// Not invoked by [`load_obj_buf_async()`].
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+    pub progress_callback: Option<LoadProgressCallback>,
 }
 
 impl LoadOptions {
@@ -639,6 +769,7 @@ pub enum LoadError {
     FaceColorOutOfBounds,
     InvalidLoadOptionConfig,
     GenericFailure,
+    Cancelled,
 }
 
 impl fmt::Display for LoadError {
@@ -660,6 +791,7 @@ impl fmt::Display for LoadError {
             LoadError::FaceColorOutOfBounds => "face vertex color index out of bounds",
             LoadError::InvalidLoadOptionConfig => "mutually exclusive load options",
             LoadError::GenericFailure => "generic failure",
+            LoadError::Cancelled => "load cancelled by progress callback",
         };
 
         f.write_str(msg)
@@ -898,7 +1030,7 @@ fn export_faces(
                         add_vertex(&mut mesh, &mut index_map, a, pos, v_color, texcoord, normal)?;
                     } else {
                         is_all_triangles = false;
-                        mesh.face_arities.push(1);
+                        mesh.face_arities.get_or_insert_with(Vec::new).push(1);
                     }
                 }
             }
@@ -910,7 +1042,7 @@ fn export_faces(
                         add_vertex(&mut mesh, &mut index_map, b, pos, v_color, texcoord, normal)?;
                     } else {
                         is_all_triangles = false;
-                        mesh.face_arities.push(2);
+                        mesh.face_arities.get_or_insert_with(Vec::new).push(2);
                     }
                 }
             }
@@ -919,7 +1051,7 @@ fn export_faces(
                 add_vertex(&mut mesh, &mut index_map, b, pos, v_color, texcoord, normal)?;
                 add_vertex(&mut mesh, &mut index_map, c, pos, v_color, texcoord, normal)?;
                 if !load_options.triangulate {
-                    mesh.face_arities.push(3);
+                    mesh.face_arities.get_or_insert_with(Vec::new).push(3);
                 }
             }
             Face::Quad(ref a, ref b, ref c, ref d) => {
@@ -934,7 +1066,7 @@ fn export_faces(
                 } else {
                     add_vertex(&mut mesh, &mut index_map, d, pos, v_color, texcoord, normal)?;
                     is_all_triangles = false;
-                    mesh.face_arities.push(4);
+                    mesh.face_arities.get_or_insert_with(Vec::new).push(4);
                 }
             }
             Face::Polygon(ref indices) => {
@@ -952,7 +1084,9 @@ fn export_faces(
                         add_vertex(&mut mesh, &mut index_map, i, pos, v_color, texcoord, normal)?;
                     }
                     is_all_triangles = false;
-                    mesh.face_arities.push(indices.len() as u32);
+                    mesh.face_arities
+                        .get_or_insert_with(Vec::new)
+                        .push(indices.len() as u32);
                 }
             }
         }
@@ -960,7 +1094,7 @@ fn export_faces(
 
     if is_all_triangles {
         // This is a triangle-only mesh.
-        mesh.face_arities = Vec::new();
+        mesh.face_arities = None;
     }
 
     Ok(mesh)
@@ -1164,7 +1298,7 @@ fn export_faces_multi_index(
                         )?;
                     } else {
                         is_all_triangles = false;
-                        mesh.face_arities.push(1);
+                        mesh.face_arities.get_or_insert_with(Vec::new).push(1);
                     }
                 }
             }
@@ -1206,7 +1340,7 @@ fn export_faces_multi_index(
                         )?;
                     } else {
                         is_all_triangles = false;
-                        mesh.face_arities.push(2);
+                        mesh.face_arities.get_or_insert_with(Vec::new).push(2);
                     }
                 }
             }
@@ -1245,7 +1379,7 @@ fn export_faces_multi_index(
                     normal,
                 )?;
                 if !load_options.triangulate {
-                    mesh.face_arities.push(3);
+                    mesh.face_arities.get_or_insert_with(Vec::new).push(3);
                 }
             }
             Face::Quad(ref a, ref b, ref c, ref d) => {
@@ -1330,7 +1464,7 @@ fn export_faces_multi_index(
                         normal,
                     )?;
                     is_all_triangles = false;
-                    mesh.face_arities.push(4);
+                    mesh.face_arities.get_or_insert_with(Vec::new).push(4);
                 }
             }
             Face::Polygon(ref indices) => {
@@ -1388,7 +1522,9 @@ fn export_faces_multi_index(
                         )?;
                     }
                     is_all_triangles = false;
-                    mesh.face_arities.push(indices.len() as u32);
+                    mesh.face_arities
+                        .get_or_insert_with(Vec::new)
+                        .push(indices.len() as u32);
                 }
             }
         }
@@ -1396,7 +1532,7 @@ fn export_faces_multi_index(
 
     if is_all_triangles {
         // This is a triangle-only mesh.
-        mesh.face_arities = Vec::new();
+        mesh.face_arities = None;
     }
 
     #[cfg(feature = "merging")]
@@ -1985,16 +2121,41 @@ where
         return Err(LoadError::InvalidLoadOptionConfig);
     }
 
+    // How often (in lines) to invoke `load_options.progress_callback`, if set.
+    // Kept coarse so the callback's cost stays negligible next to parsing.
+    const PROGRESS_REPORT_INTERVAL: u64 = 1000;
+
     let mut models = TmpModels::new();
     let mut materials = TmpMaterials::new();
 
+    let mut lines_read: u64 = 0;
+    let mut bytes_read: u64 = 0;
+
     for line in reader.lines() {
+        lines_read += 1;
+        // `BufRead::lines()` strips the line terminator, so this
+        // undercounts by one byte per line. Good enough for progress
+        // reporting.
+        bytes_read += line.as_ref().map(|l| l.len() as u64 + 1).unwrap_or(0);
+
         let parse_return = parse_obj_line(line, load_options, &mut models, &materials)?;
         match parse_return {
             ParseReturnType::LoadMaterial(mat_file) => {
                 materials.merge(material_loader(mat_file.as_path()));
             }
             ParseReturnType::None => {}
+        }
+
+        if let Some(callback) = &load_options.progress_callback {
+            if lines_read.is_multiple_of(PROGRESS_REPORT_INTERVAL) {
+                let progress = LoadProgress {
+                    lines_read,
+                    bytes_read,
+                };
+                if let ControlFlow::Break(()) = callback.call(&progress) {
+                    return Err(LoadError::Cancelled);
+                }
+            }
         }
     }
 
@@ -2032,14 +2193,15 @@ pub fn load_mtl_buf<B: BufRead>(reader: &mut B) -> MTLLoadResult {
 ///
 /// <div class="warning">
 ///
-/// This function is not fully async, as it does not use async reader objects. This means you
-/// must either use a blocking reader object, which negates the point of async in the first place,
-/// or you must asynchronously read the entire buffer into memory, and then give an in-memory reader
+/// This function is not fully async, as it does not use async reader objects.
+/// This means you must either use a blocking reader object, which negates the
+/// point of async in the first place, or you must asynchronously read the
+/// entire buffer into memory, and then give an in-memory reader
 /// to this function, which is wasteful with memory and not terribly efficient.
 ///
-/// Instead, it is recommended to use crate-specific feature flag support to enable support for
-/// various third-party async readers. For example, you can enable the `tokio` feature flag to
-/// use [tokio::load_obj_buf()].
+/// Instead, it is recommended to use crate-specific feature flag support to
+/// enable support for various third-party async readers. For example, you can
+/// enable the `tokio` feature flag to use [tokio::load_obj_buf()].
 ///
 /// </div>
 ///
@@ -2146,13 +2308,13 @@ where
 
 /// Optional module supporting async loading with `futures` traits.
 ///
-/// The functions in this module are drop-in replacements for the standard non-async functions in
-/// this crate, but tailored to use [futures](https://crates.io/crates/futures)
+/// The functions in this module are drop-in replacements for the standard
+/// non-async functions in this crate, but tailored to use [futures](https://crates.io/crates/futures)
 /// [AsyncRead](futures_lite::AsyncRead) traits.
 ///
-/// While `futures` provides basic read/write async traits, it does *not* provide filesystem IO
-/// implementations for these traits, so this module only contains `*_buf()` variants of this
-/// crate's functions.
+/// While `futures` provides basic read/write async traits, it does *not*
+/// provide filesystem IO implementations for these traits, so this module only
+/// contains `*_buf()` variants of this crate's functions.
 #[cfg(feature = "futures")]
 pub mod futures {
     use super::*;
@@ -2161,8 +2323,9 @@ pub mod futures {
 
     /// Asynchronously load the various meshes in an 'OBJ' buffer.
     ///
-    /// This functions exactly like [crate::load_obj_buf()], but uses async read traits and an async
-    /// `material_loader` function. See [crate::load_obj_buf()] for more.
+    /// This functions exactly like [crate::load_obj_buf()], but uses async read
+    /// traits and an async `material_loader` function. See
+    /// [crate::load_obj_buf()] for more.
     ///
     /// This is the [futures](https://crates.io/crates/futures) variant of `load_obj_buf()`; see
     /// [module-level](futures) documentation for more.
@@ -2196,7 +2359,8 @@ pub mod futures {
     ///             _ => unreachable!(),
     ///         }
     ///     },
-    /// ).await;
+    /// )
+    /// .await;
     /// # }
     /// ```
     pub async fn load_obj_buf<B, ML, MLFut>(
@@ -2262,21 +2426,24 @@ pub mod futures {
 
 /// Optional module supporting async loading with `tokio` traits.
 ///
-/// The functions in this module are drop-in replacements for the standard non-async functions in
-/// this crate, but tailored to use [tokio](https://crates.io/crates/tokio)
+/// The functions in this module are drop-in replacements for the standard
+/// non-async functions in this crate, but tailored to use [tokio](https://crates.io/crates/tokio)
 /// [AsyncRead](::tokio::io::AsyncRead) traits.
 #[cfg(feature = "tokio")]
 pub mod tokio {
     use super::*;
 
-    use ::tokio::fs::File;
-    use ::tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-    use ::tokio::pin;
+    use ::tokio::{
+        fs::File,
+        io::{AsyncBufRead, AsyncBufReadExt, BufReader},
+        pin,
+    };
 
-    /// Load the various objects specified in the `OBJ` file and any associated `MTL` file.
+    /// Load the various objects specified in the `OBJ` file and any associated
+    /// `MTL` file.
     ///
-    /// This functions exactly like [crate::load_obj()] but uses async filesystem logic. See
-    /// [crate::load_obj()] for more.
+    /// This functions exactly like [crate::load_obj()] but uses async
+    /// filesystem logic. See [crate::load_obj()] for more.
     ///
     /// This is the [tokio](https://crates.io/crates/tokio) variant of `load_obj()`; see
     /// [module-level](tokio) documentation for more.
@@ -2293,7 +2460,8 @@ pub mod tokio {
             }
         };
         load_obj_buf(BufReader::new(file), load_options, |mat_path| {
-            // This needs to be "copied" into this closure before moving it into the async one below
+            // This needs to be "copied" into this closure before moving it into the async
+            // one below
             let file_name: &Path = file_name.as_ref();
             let file_name = file_name.to_path_buf();
             async move {
@@ -2311,8 +2479,8 @@ pub mod tokio {
 
     /// Load the materials defined in a `MTL` file.
     ///
-    /// This functions exactly like [crate::load_mtl()] but uses async filesystem logic. See
-    /// [crate::load_mtl()] for more.
+    /// This functions exactly like [crate::load_mtl()] but uses async
+    /// filesystem logic. See [crate::load_mtl()] for more.
     ///
     /// This is the [tokio](https://crates.io/crates/tokio) variant of `load_mtl()`; see
     /// [module-level](tokio) documentation for more.
@@ -2333,8 +2501,9 @@ pub mod tokio {
 
     /// Asynchronously load the various meshes in an 'OBJ' buffer.
     ///
-    /// This functions exactly like [crate::load_obj_buf()], but uses async read traits and an async
-    /// `material_loader` function. See [crate::load_obj_buf()] for more.
+    /// This functions exactly like [crate::load_obj_buf()], but uses async read
+    /// traits and an async `material_loader` function. See
+    /// [crate::load_obj_buf()] for more.
     ///
     /// This is the [tokio](https://crates.io/crates/tokio) variant of `load_obj_buf()`; see
     /// [module-level](tokio) documentation for more.
