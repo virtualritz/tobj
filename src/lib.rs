@@ -246,11 +246,11 @@ use std::future::Future;
 #[cfg(feature = "merging")]
 use std::mem::size_of;
 
-#[cfg(feature = "gxhash")]
-use gxhash::{HashMap, HashMapExt};
+#[cfg(feature = "ahash")]
+type HashMap<K, V> = ahash::AHashMap<K, V>;
 
-#[cfg(not(feature = "gxhash"))]
-use std::collections::HashMap;
+#[cfg(not(feature = "ahash"))]
+type HashMap<K, V> = std::collections::HashMap<K, V>;
 
 /// Typical [`LoadOptions`] for using meshes in a GPU/relatime context.
 ///
@@ -926,13 +926,13 @@ fn parse_face(
     tex_sz: usize,
     norm_sz: usize,
 ) -> bool {
-    let mut indices = Vec::new();
-    for f in face_str {
-        match VertexIndices::parse(f, pos_sz, tex_sz, norm_sz) {
-            Some(v) => indices.push(v),
-            None => return false,
-        }
-    }
+    let indices: Vec<VertexIndices> = match face_str
+        .map(|f| VertexIndices::parse(f, pos_sz, tex_sz, norm_sz))
+        .collect()
+    {
+        Some(indices) => indices,
+        None => return false,
+    };
     // Check what kind face we read and push it on
     match indices.len() {
         1 => faces.push(Face::Point(indices[0])),
@@ -1781,9 +1781,8 @@ impl TmpMaterials {
                 // materials by our current length
                 let mat_offset = self.materials.len();
                 self.materials.append(&mut mats);
-                for m in map {
-                    self.mat_map.insert(m.0, m.1 + mat_offset);
-                }
+                self.mat_map
+                    .extend(map.into_iter().map(|(name, idx)| (name, idx + mat_offset)));
             }
             Err(e) => {
                 self.mtlerr = Some(e);

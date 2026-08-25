@@ -25,12 +25,11 @@ async = []
 arbitrary = ["arbitrary/derive"]
 futures = ["dep:futures-lite", "async"]
 tokio = ["dep:tokio", "async"]
-gxhash = ["dep:gxhash"]
 use_f64 = []
 
 [dependencies]
 arbitrary = { version = "1.4", optional = true }
-gxhash = { version = "=2.2.4", optional = true, path = "../gxhash" }
+ahash = { version = "0.8", optional = true }
 futures-lite = { version = "2.6", optional = true }
 log = { version = "0.4", optional = true }
 tokio = { version = "1", optional = true, features = ["io-util", "fs"] }
